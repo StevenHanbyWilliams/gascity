@@ -1243,6 +1243,17 @@ func (m *Manager) Suspend(id string) error {
 			return err
 		}
 
+		// Invalidate exit tracking before the provider can report death. An
+		// explicit suspend is neither a rapid crash nor unproductive churn;
+		// either classification would discard the conversation resume key.
+		// Restore the wake stamp if stopping a live runtime fails.
+		lastWokeAt := b.Metadata["last_woke_at"]
+		if lastWokeAt != "" {
+			if err := m.store.SetMetadata(id, "last_woke_at", ""); err != nil {
+				return fmt.Errorf("preparing suspension exit tracking: %w", err)
+			}
+		}
+
 		// Kill the runtime session. Stop is provider-idempotent, so call it
 		// even when liveness already reports false; tmux remain-on-exit panes
 		// can be non-running but still need their session artifact removed.
@@ -1256,7 +1267,13 @@ func (m *Manager) Suspend(id string) error {
 				err = nil
 			}
 			if err != nil {
-				return fmt.Errorf("stopping runtime session: %w", err)
+				stopErr := fmt.Errorf("stopping runtime session: %w", err)
+				if lastWokeAt != "" {
+					if restoreErr := m.store.SetMetadata(id, "last_woke_at", lastWokeAt); restoreErr != nil {
+						return errors.Join(stopErr, fmt.Errorf("restoring suspension exit tracking: %w", restoreErr))
+					}
+				}
+				return stopErr
 			}
 		}
 
