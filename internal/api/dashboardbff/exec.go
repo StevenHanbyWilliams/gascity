@@ -92,7 +92,11 @@ func (r *execRunner) run(ctx context.Context, cmd string, args []string, timeout
 	if cctx.Err() == context.DeadlineExceeded && !stdout.truncated {
 		return nil, &execError{msg: "exec timed out", kind: execErrTimeout}
 	}
-	if cctx.Err() == context.Canceled && !stdout.truncated {
+	// runErr != nil keeps this off a child that completed successfully before
+	// the cancel landed: its stdout is whole, and callers like
+	// localToolVersions memoize probe results (error rows included) for
+	// localToolsTTL.
+	if runErr != nil && cctx.Err() == context.Canceled && !stdout.truncated {
 		return nil, &execError{msg: "exec canceled", kind: execErrSpawn}
 	}
 
