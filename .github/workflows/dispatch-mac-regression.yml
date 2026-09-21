@@ -1,0 +1,51 @@
+name: Dispatch Mac Regression
+
+on:
+  pull_request_target:
+    branches: [main]
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dispatch-mac-regression-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  checkout-base:
+    name: Checkout base (trust boundary)
+    if: >-
+      github.event.pull_request.head.repo.full_name != github.repository &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      # This workflow never checks out or runs pull request code. The base-ref
+      # checkout below exists only to make the trust boundary explicit before
+      # the next job invokes mac-regression.yml as a reusable workflow
+      # (uses:), which always runs from this trusted definition regardless --
+      # never the fork head, never fork-controlled code. Mirrors
+      # dispatch-labeled-pr-suite.yml's checkout step.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+  mac-regression:
+    name: Mac Regression (fork PR)
+    needs: checkout-base
+    permissions:
+      checks: write
+      contents: read
+    uses: ./.github/workflows/mac-regression.yml
+    with:
+      suite: full
+      pr_number: ${{ github.event.pull_request.number }}
+      head_repo: ${{ github.event.pull_request.head.repo.full_name }}
+      head_sha: ${{ github.event.pull_request.head.sha }}
+      head_ref: ${{ github.event.pull_request.head.ref }}
+    secrets: inherit
