@@ -342,7 +342,7 @@ func collectCityStatusSnapshotFromStoreSnapshot(
 		})
 	}
 
-	snapshot.Orders = collectCityStatusOrders(cfg, cityPath)
+	snapshot.Orders = collectCityStatusOrders(cfg, cityPath, stderr)
 
 	return snapshot
 }
@@ -360,12 +360,20 @@ const orderSuppressionEventTailLimit = 2000
 // the two commands can never disagree, plus the current open-work gate
 // suppression state (events.OrderSuppressed), which neither doctor check
 // reads.
-func collectCityStatusOrders(cfg *config.City, cityPath string) []cityStatusOrder {
+//
+// The firing-current check is wired with the same
+// doctor.WithOrderFiringCurrentLastRunFunc(doctorOrderFiringCurrentLastRunFunc(...))
+// option cmd_doctor.go's buildDoctorChecks uses (mirrored, not shared,
+// because the two live in different construction paths). Without it, an
+// order whose last firing falls outside the check's bounded events.jsonl
+// tail read has no fallback and gc status silently disagrees with gc
+// doctor, which does have the authoritative order-run-history lookup.
+func collectCityStatusOrders(cfg *config.City, cityPath string, stderr io.Writer) []cityStatusOrder {
 	var result []cityStatusOrder
 
 	checkCtx := &doctor.CheckContext{CityPath: cityPath}
 	for _, r := range []*doctor.CheckResult{
-		doctor.NewOrderFiringCurrentCheck(cfg, cityPath).Run(checkCtx),
+		doctor.NewOrderFiringCurrentCheck(cfg, cityPath, doctor.WithOrderFiringCurrentLastRunFunc(doctorOrderFiringCurrentLastRunFunc(cityPath, cfg, stderr))).Run(checkCtx),
 		doctor.NewOrderOutcomeHealthyCheck(cfg, cityPath).Run(checkCtx),
 	} {
 		if r.Status == doctor.StatusOK {
@@ -385,7 +393,7 @@ func collectCityStatusOrders(cfg *config.City, cityPath string) []cityStatusOrde
 	// in the tail window and only its latest Consecutive/FirstSuppressed
 	// values reflect the current suppression state.
 	eventsPath := filepath.Join(cityPath, ".gc", "events.jsonl")
-	suppressed, _ := events.ReadFilteredTail(eventsPath, events.Filter{Type: events.OrderSuppressed}, orderSuppressionEventTailLimit)
+	suppressed, _ := events.ReadFilteredTail(eventsPath, events.Filter{Type: events.OrderSuppressed}, orderSuppressionEventTailLimit) //nolint:errcheck // best-effort: a missing/unreadable events.jsonl just yields no suppression rows, matching the firing/outcome checks' own tolerance for an absent log
 	var suppressedRows []cityStatusOrder
 	suppressedIndex := make(map[string]int)
 	for _, e := range suppressed {
