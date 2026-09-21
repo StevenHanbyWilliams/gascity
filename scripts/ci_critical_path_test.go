@@ -700,6 +700,7 @@ func TestMacRegressionGateCentralizesTierRouting(t *testing.T) {
 		"EVENT_NAME":   "${{ github.event_name }}",
 		"SUITE_INPUT":  "${{ inputs.suite }}",
 		"PR_HEAD_REPO": "${{ github.event.pull_request.head.repo.full_name }}",
+		"REPOSITORY":   "${{ github.repository }}",
 		"PR_DRAFT":     "${{ github.event.pull_request.draft }}",
 		"NEEDS_LABEL":  "${{ contains(github.event.pull_request.labels.*.name, 'needs-mac') }}",
 		"PATH_HIT":     "${{ steps.filter.outputs.mac_sensitive }}",
@@ -710,44 +711,16 @@ func TestMacRegressionGateCentralizesTierRouting(t *testing.T) {
 		}
 	}
 
-	// Every trigger path the exit_contract enumerates must be handled so the
-	// refactor preserves today's per-job run/skip outcome exactly.
-	for _, marker := range []string{
-		`"$EVENT_NAME" == "schedule"`,
-		`run_smoke=true; run_full=true; run_review_formulas=true`,
-		`"$EVENT_NAME" == "workflow_dispatch"`,
-		`case "$SUITE_INPUT" in`,
-		`needs-mac)`,
-		`"$EVENT_NAME" == "pull_request"`,
-		`"$PR_HEAD_REPO" != "${{ github.repository }}"`,
-		`"$PR_DRAFT" == "true"`,
-		`"$NEEDS_LABEL" == "true"`,
-		`echo "run_smoke=$run_smoke"`,
-		`echo "run_full=$run_full"`,
-		`echo "run_review_formulas=$run_review_formulas"`,
-		`echo "reason=$reason"`,
-	} {
-		if !strings.Contains(decideStep.Run, marker) {
-			t.Errorf("gate decision step run script missing %q", marker)
-		}
-	}
-
-	// An unrecognized (or default) $SUITE_INPUT on a manual dispatch must
-	// still run the smoke tier, not silently run nothing — run_smoke must
-	// be set unconditionally before the case statement, not only inside
-	// specific case branches, so the catch-all `*)` arm inherits it too.
-	const dispatchMarker = `"$EVENT_NAME" == "workflow_dispatch" ]]; then`
-	dispatchIdx := strings.Index(decideStep.Run, dispatchMarker)
-	if dispatchIdx < 0 {
-		t.Fatal("gate decision step run script missing workflow_dispatch branch")
-	}
-	afterDispatch := decideStep.Run[dispatchIdx+len(dispatchMarker):]
-	caseIdx := strings.Index(afterDispatch, `case "$SUITE_INPUT" in`)
-	if caseIdx < 0 {
-		t.Fatal("gate decision step run script missing case statement in workflow_dispatch branch")
-	}
-	if preCase := afterDispatch[:caseIdx]; !strings.Contains(preCase, "run_smoke=true") {
-		t.Errorf("gate decision step workflow_dispatch branch does not set run_smoke=true before the case statement (preamble %q) — an unrecognized suite input must still default to the smoke tier", preCase)
+	// The per-trigger tiering logic (ga-hahxhp) moved out of inline bash and
+	// into .github/workflows/scripts/mac_regression_gate.py, a unit-tested
+	// module (test_mac_regression_gate.py covers every trigger path this
+	// test used to check by string-matching, plus the workflow_call branch
+	// bash never had — workflow_call fell through every elif to the
+	// unmatched default and silently no-opped reusable-workflow callers like
+	// rc-gate.yml). This step must still be the one place that invokes it.
+	const wantDecideRun = "python3 .github/workflows/scripts/mac_regression_gate.py\n"
+	if decideStep.Run != wantDecideRun {
+		t.Errorf("gate decision step run = %q, want %q", decideStep.Run, wantDecideRun)
 	}
 }
 
