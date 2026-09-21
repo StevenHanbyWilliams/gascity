@@ -248,3 +248,134 @@ func TestCityStatusOrdersSurfacesGateSuppression(t *testing.T) {
 		t.Fatalf("stdout missing consecutive-suppression count:\n%s", stdout.String())
 	}
 }
+
+// TestCityStatusOrdersFallsBackToOrderRunHistoryOutsideEventTail is the
+// round-1 request-changes fix for ga-eua7hl: collectCityStatusOrders must
+// wire doctor.WithOrderFiringCurrentLastRunFunc the same way cmd_doctor.go's
+// buildDoctorChecks does (see TestBuildDoctorChecksOrderFiringCurrentUsesOrderRunHistory
+// in cmd_doctor_order_firing_test.go, whose fixture this mirrors). Without
+// that option, an order whose only event.jsonl evidence is stale (or,
+// on a busy city, has scrolled entirely outside the bounded
+// orderFiringEventTailLimit-line tail read) has no fallback, and
+// collectCityStatusOrders silently disagrees with gc doctor -- which does
+// have the authoritative order-run-history lookup -- by reporting a false
+// stale/error for an order that is actually fine.
+//
+// Unlike the other tests in this file, this one needs a real on-disk bead
+// store (not beads.NewMemStore()): the LastRunFunc under test
+// (doctorOrderFiringCurrentLastRunFunc) resolves order-run history through
+// cachedOrderHistoryStoresResolver, which opens the city's actual scoped
+// file store.
+func TestCityStatusOrdersFallsBackToOrderRunHistoryOutsideEventTail(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+
+	cityPath := t.TempDir()
+	t.Chdir(cityPath)
+	mustWriteDoctorOrderFiringTestFile(t, filepath.Join(cityPath, "city.toml"), `[workspace]
+name = "test-city"
+`)
+	if err := os.MkdirAll(filepath.Join(cityPath, "orders"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	formulasDir := filepath.Join(cityPath, "formulas")
+	if err := os.MkdirAll(formulasDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeCityStatusOrderTOML(t, cityPath, "mol-dog-stale-db", "cron", "")
+	// writeCityStatusOrderTOML only handles the [order].interval field; this
+	// check's cron order needs [order].schedule instead, so append it directly.
+	appendToFile(t, filepath.Join(cityPath, "orders", "mol-dog-stale-db.toml"), "schedule = \"0 */4 * * *\"\n")
+
+	if err := ensureScopedFileStoreLayout(cityPath); err != nil {
+		t.Fatalf("ensureScopedFileStoreLayout: %v", err)
+	}
+	if err := ensurePersistedScopeLocalFileStore(cityPath); err != nil {
+		t.Fatalf("ensurePersistedScopeLocalFileStore: %v", err)
+	}
+	store, err := openStoreAtForCity(cityPath, cityPath)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity: %v", err)
+	}
+	// The authoritative signal: a fresh order-run bead, created "now". This is
+	// what the LastRunFunc fallback must find once the event-tail evidence is
+	// deemed insufficient.
+	if _, err := store.Create(beads.Bead{
+		Title:  "manual run mol-dog-stale-db",
+		Type:   "molecule",
+		Labels: []string{"order-run:mol-dog-stale-db"},
+	}); err != nil {
+		t.Fatalf("create recent order-run bead: %v", err)
+	}
+
+	now := time.Now().UTC()
+	// The only event-tail evidence is 13h old against a 4h cron interval --
+	// stale enough (> 1.5x interval) that eventEvidenceSuffices rejects it,
+	// which is exactly the condition (also reached when a firing has scrolled
+	// outside the bounded tail entirely) that must trigger the LastRunFunc
+	// fallback rather than reporting the raw stale event.
+	writeCityStatusOrderEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "mol-dog-stale-db", Ts: now.Add(-13 * time.Hour)},
+	)
+
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		FormulaLayers: config.FormulaLayers{City: []string{formulasDir}},
+	}
+
+	// Ground truth: doctor's own check, wired with the exact same LastRunFunc
+	// option cmd_doctor.go's buildDoctorChecks uses (and
+	// TestBuildDoctorChecksOrderFiringCurrentUsesOrderRunHistory already
+	// proves resolves to StatusOK on this fixture shape).
+	var doctorStderr bytes.Buffer
+	wantResult := doctor.NewOrderFiringCurrentCheck(cfg, cityPath,
+		doctor.WithOrderFiringCurrentLastRunFunc(doctorOrderFiringCurrentLastRunFunc(cityPath, cfg, &doctorStderr)),
+	).Run(&doctor.CheckContext{CityPath: cityPath})
+	if wantResult.Status != doctor.StatusOK {
+		t.Fatalf("fixture sanity: doctor order-firing-current status = %v, want StatusOK (order-run history is fresh); msg = %s; stderr = %s", wantResult.Status, wantResult.Message, doctorStderr.String())
+	}
+
+	sp := runtime.NewFake()
+	var stderr bytes.Buffer
+	snapshot := collectCityStatusSnapshot(sp, cfg, cityPath, store, &stderr)
+
+	// collectCityStatusOrders drops StatusOK results entirely (see the
+	// "continue" above), so the healthy-per-doctor check must produce no
+	// Orders entry at all. cityStatusOrder.Name is the *check's* name
+	// (doctor.CheckResult.Name, e.g. "order-firing-current") for rows from
+	// this loop -- not the order's own name -- matching how
+	// TestCityStatusOrdersSurfacesStaleFiring/RepeatedFailures look rows up
+	// via findCityStatusOrder(t, snapshot.Orders, wantResult.Name).
+	//
+	// Without the LastRunFunc wired, lastRun is nil, eventEvidenceSuffices
+	// still rejects the 13h-old event against the 4h interval, and
+	// latestOrderFiredAtUsing returns that stale time unmodified --
+	// classifying the check as genuinely CRITICAL-stale and producing a
+	// spurious "order-firing-current" entry here, silently disagreeing with
+	// gc doctor's StatusOK (asserted above via wantResult).
+	for _, o := range snapshot.Orders {
+		if o.Name == wantResult.Name {
+			t.Fatalf("Orders contains %+v for check %q, want no entry; gc doctor reports %v via order-run history, so gc status must too, not surface it as unhealthy; stderr = %s", o, wantResult.Name, wantResult.Status, stderr.String())
+		}
+	}
+}
+
+// appendToFile appends content to an existing file, used where
+// writeCityStatusOrderTOML's fixed [order] shape doesn't cover a field
+// (here, cron's "schedule" vs. cooldown's "interval").
+func appendToFile(t *testing.T, path, content string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open %s for append: %v", path, err)
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			t.Fatalf("close %s: %v", path, err)
+		}
+	}()
+	if _, err := f.WriteString(content); err != nil {
+		t.Fatalf("append to %s: %v", path, err)
+	}
+}
