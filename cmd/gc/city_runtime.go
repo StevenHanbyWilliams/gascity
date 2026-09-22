@@ -96,6 +96,18 @@ const reloadOrderDrainTimeout = 1 * time.Second
 
 var orderRescanInterval = time.Minute
 
+// shouldRunOrphanRelease reports whether beadReconcileTick's cadence gate
+// should let release_orphaned_pool_assignments run on this tick: true the
+// first time (last is the zero value) or once minInterval has elapsed since
+// last, false otherwise. Interim cadence-gate mitigation for ga-57er0d;
+// remove once ga-8uf72n's off-tick convergence lane supersedes it.
+func shouldRunOrphanRelease(now, last time.Time, minInterval time.Duration) bool {
+	if last.IsZero() {
+		return true
+	}
+	return now.Sub(last) >= minInterval
+}
+
 // CityRuntime holds all running state for a single city's reconciliation
 // loop. It encapsulates the per-city lifecycle that was previously spread
 // across runController and controllerLoop. A machine-wide supervisor can
@@ -131,6 +143,13 @@ type CityRuntime struct {
 	orderRescanEnabled      bool
 	orderRescanLast         time.Time
 	trace                   *sessionReconcilerTraceManager
+
+	// orphanReleaseLast records the wall-clock time beadReconcileTick last
+	// actually ran release_orphaned_pool_assignments. Interim cadence-gate
+	// mitigation for ga-57er0d (skip the sweep on most ticks instead of
+	// every tick); superseded by ga-8uf72n's off-tick convergence lane —
+	// remove this field once ga-8uf72n lands.
+	orphanReleaseLast time.Time
 
 	// routeRecovery is the route-repair lane: an event-fed delta pass in the
 	// tick and a cadenced authoritative scan behind it. Created on first use so
